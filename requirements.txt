@@ -2,6 +2,6 @@ fastapi
 uvicorn[standard]
 python-multipart
 opencv-python-headless
-numpy
+numpy==1.26.4
+protobuf==4.25.3
 mediapipe==0.10.32
-protobuf<5
