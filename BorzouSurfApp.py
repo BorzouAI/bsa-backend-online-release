@@ -5,12 +5,14 @@
 
 import os
 import hashlib
+import sys
+import tempfile
+
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 import cv2
 import numpy as np
-import tempfile
 
 app = FastAPI()
 
@@ -23,9 +25,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+# ✅ Debug endpoint (no Shell needed)
+# Hit: https://bsa-backend-online-release-cmk9.onrender.com/debug/mediapipe
+@app.get("/debug/mediapipe")
+def debug_mediapipe():
+    try:
+        import mediapipe as mp
+        return {
+            "python": sys.version,
+            "mediapipe_version": getattr(mp, "__version__", "unknown"),
+            "mediapipe_file": getattr(mp, "__file__", "unknown"),
+            "has_solutions": hasattr(mp, "solutions"),
+            "has_tasks": hasattr(mp, "tasks"),
+            "has_python_pkg": hasattr(mp, "python"),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to import mediapipe: {e}")
+
 
 # --- Scoring config (simple, as you had) ---
 BASE_POINTS = {
@@ -72,6 +94,37 @@ def detect_pumping(buf):
     return zero_crossings >= 2 and 0.001 < avg_disp < 0.01 and horiz_disp < 0.02
 
 
+def _get_mp_pose_module():
+    """
+    Robustly obtains the Pose solution module.
+    Fixes cases where `mediapipe` imports but `mp.solutions` isn't attached
+    (or is missing due to packaging/import weirdness).
+    """
+    import mediapipe as mp
+
+    # Normal path
+    if hasattr(mp, "solutions"):
+        try:
+            return mp.solutions.pose
+        except Exception:
+            pass
+
+    # Compatibility path: mediapipe.python.solutions
+    try:
+        from mediapipe.python import solutions as mp_solutions  # type: ignore
+        # Attach for downstream code that expects mp.solutions.*
+        mp.solutions = mp_solutions  # type: ignore
+        return mp_solutions.pose
+    except Exception as e:
+        raise RuntimeError(
+            "Mediapipe imported but Pose Solutions API is unavailable. "
+            f"mp.__version__={getattr(mp, '__version__', 'unknown')} "
+            f"mp.__file__={getattr(mp, '__file__', 'unknown')} "
+            f"hasattr(mp,'solutions')={hasattr(mp,'solutions')} "
+            f"inner_error={e}"
+        )
+
+
 @app.post("/analyze")
 async def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
     """
@@ -87,18 +140,22 @@ async def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
     if not video_bytes:
         raise HTTPException(status_code=400, detail="Empty video file.")
 
-    # (Duplicate check removed on purpose)
-
     tmp_path = None
     try:
         # Lazy import so server can start without mediapipe installed
         try:
-            import mediapipe as mp
+            import mediapipe as mp  # noqa: F401
         except Exception as e:
             raise HTTPException(
                 status_code=503,
                 detail=f"Mediapipe not available on server. Install it to analyze videos. ({e})",
             )
+
+        # ✅ Robust pose module getter (fixes "no attribute solutions")
+        try:
+            mp_pose = _get_mp_pose_module()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Server error: {e}")
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
             tmp.write(video_bytes)
@@ -112,7 +169,7 @@ async def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
         # Non-pumping: emit once per event; hold until different maneuver or neutral gap
-        STABLE_SEC = 0.20       # require ~0.20s stable label
+        STABLE_SEC = 0.20         # require ~0.20s stable label
         NEUTRAL_RESET_SEC = 0.25  # need ~0.25s neutral to clear active move
 
         # Pumping: count one per full oscillation (up+down) with min interval + amplitude
@@ -123,7 +180,6 @@ async def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
         NEUTRAL_RESET_FRAMES = max(1, int(fps * NEUTRAL_RESET_SEC))
         PUMP_MIN_INTERVAL_FR = max(1, int(fps * PUMP_MIN_INTERVAL_SEC))
 
-        mp_pose = mp.solutions.pose
         log = []
         buffer = []
         is_frontside = (stance == "f")
@@ -180,7 +236,7 @@ async def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
             model_complexity=2,
             smooth_landmarks=True,
             min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_tracking_confidence=0.5,
         ) as pose:
             while True:
                 ret, frame = cap.read()
@@ -277,4 +333,3 @@ async def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
                 os.remove(tmp_path)
             except Exception:
                 pass
-
