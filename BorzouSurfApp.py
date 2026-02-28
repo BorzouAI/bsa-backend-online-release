@@ -7,6 +7,7 @@ import os
 import hashlib
 import sys
 import tempfile
+import threading
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -103,12 +104,49 @@ def _get_mp_pose_module():
     return mp.solutions.pose
 
 
+# --- Global MediaPipe Pose (init once, reuse) ---
+# NOTE: This is not a new dependency. It's just a pattern so we don't
+# re-create the Pose model on every /analyze request (very slow on Render).
+_POSE_LOCK = threading.Lock()
+_MP_POSE = None
+_POSE = None
+
+
+def _get_pose_singleton():
+    global _MP_POSE, _POSE
+    if _POSE is not None and _MP_POSE is not None:
+        return _MP_POSE, _POSE
+
+    with _POSE_LOCK:
+        if _POSE is not None and _MP_POSE is not None:
+            return _MP_POSE, _POSE
+
+        mp_pose = _get_mp_pose_module()
+
+        # IMPORTANT SPEED CHANGE:
+        # model_complexity=0 is the lite model (much faster than 2 on Render).
+        pose = mp_pose.Pose(
+            model_complexity=0,  # was 2 (heavy)
+            smooth_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+
+        _MP_POSE = mp_pose
+        _POSE = pose
+        return _MP_POSE, _POSE
+
+
 @app.post("/analyze")
 def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
     """
     IMPORTANT CHANGES:
     - Made this endpoint sync (`def`, not `async def`) so heavy CPU work doesn't freeze the server.
     - Added frame skipping + downscaling so Render free tier doesn't hang forever.
+
+    NEW (performance-only, minimal):
+    - Reuse a single global MediaPipe Pose instance (no per-request model init).
+    - Switch from heavy model_complexity=2 to lite model_complexity=0.
     """
     if not video:
         raise HTTPException(status_code=400, detail="No video uploaded.")
@@ -124,9 +162,9 @@ def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
 
     tmp_path = None
     try:
-        # Mediapipe import (will raise clear error if missing)
+        # Mediapipe Pose singleton (init once)
         try:
-            mp_pose = _get_mp_pose_module()
+            mp_pose, pose = _get_pose_singleton()
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Server error: {e}")
 
@@ -206,103 +244,101 @@ def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
                 return "Cutback"
             return ""
 
-        with mp_pose.Pose(
-            model_complexity=2,
-            smooth_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        ) as pose:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-                # skip frames
-                if frame_idx % FRAME_STEP != 0:
-                    frame_idx += 1
-                    continue
+            # skip frames
+            if frame_idx % FRAME_STEP != 0:
+                frame_idx += 1
+                continue
 
-                # cap analyzed work
-                analyzed_frames += 1
-                if analyzed_frames > MAX_ANALYZED_FRAMES:
-                    break
+            # cap analyzed work
+            analyzed_frames += 1
+            if analyzed_frames > MAX_ANALYZED_FRAMES:
+                break
 
-                # downscale to speed up mediapipe
-                h, w = frame.shape[:2]
-                if w > 640:
-                    new_w = 640
-                    new_h = int(h * (new_w / w))
-                    frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            # downscale to speed up mediapipe
+            h, w = frame.shape[:2]
+            if w > 640:
+                new_w = 640
+                new_h = int(h * (new_w / w))
+                frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # MediaPipe Pose is not guaranteed thread-safe across workers;
+            # we guard access just in case Render runs concurrent requests.
+            with _POSE_LOCK:
                 results = pose.process(rgb)
 
-                if not results.pose_landmarks:
-                    last_neutral_frame = analyzed_frames
-                    frame_idx += 1
-                    continue
-
-                lms = results.pose_landmarks.landmark
-                center = get_point(lms, mp_pose.PoseLandmark.LEFT_HIP)
-                buffer.append(center)
-                if len(buffer) > 12:
-                    buffer.pop(0)
-
-                label = classify(buffer, lms)
-
-                if label == "":
-                    last_neutral_frame = analyzed_frames
-
-                # Pumping
-                if len(buffer) >= 2:
-                    vy = buffer[-1][1] - buffer[-2][1]
-                    vy_sign = 1 if vy > 0 else (-1 if vy < 0 else 0)
-
-                    y_vals = [p[1] for p in buffer]
-                    y_range = (max(y_vals) - min(y_vals)) if y_vals else 0.0
-
-                    if label == "Pumping":
-                        if vy_sign != 0 and vy_sign != last_vy_sign:
-                            pump_phase += 1
-                            last_vy_sign = vy_sign
-                        if (
-                            pump_phase >= 2
-                            and (analyzed_frames - last_pump_emit_frame) >= PUMP_MIN_INTERVAL_FR
-                            and y_range >= PUMP_MIN_Y_RANGE
-                        ):
-                            log.append("Pumping")
-                            last_pump_emit_frame = analyzed_frames
-                            pump_phase = 0
-                    else:
-                        if (analyzed_frames - last_neutral_frame) >= NEUTRAL_RESET_FRAMES:
-                            pump_phase = 0
-
-                    if vy_sign != 0:
-                        last_vy_sign = vy_sign
-
-                # Non-pumping
-                if label != "" and label != "Pumping":
-                    if label == stable_label:
-                        stable_count += 1
-                    else:
-                        stable_label = label
-                        stable_count = 1
-
-                    if (analyzed_frames - last_neutral_frame) >= NEUTRAL_RESET_FRAMES:
-                        active_move = ""
-
-                    if stable_count >= MIN_STABLE_FRAMES:
-                        if active_move == "":
-                            log.append(label)
-                            active_move = label
-                        elif active_move != label:
-                            log.append(label)
-                            active_move = label
-                elif label == "":
-                    stable_label = ""
-                    stable_count = 0
-
+            if not results.pose_landmarks:
+                last_neutral_frame = analyzed_frames
                 frame_idx += 1
+                continue
+
+            lms = results.pose_landmarks.landmark
+            center = get_point(lms, mp_pose.PoseLandmark.LEFT_HIP)
+            buffer.append(center)
+            if len(buffer) > 12:
+                buffer.pop(0)
+
+            label = classify(buffer, lms)
+
+            if label == "":
+                last_neutral_frame = analyzed_frames
+
+            # Pumping
+            if len(buffer) >= 2:
+                vy = buffer[-1][1] - buffer[-2][1]
+                vy_sign = 1 if vy > 0 else (-1 if vy < 0 else 0)
+
+                y_vals = [p[1] for p in buffer]
+                y_range = (max(y_vals) - min(y_vals)) if y_vals else 0.0
+
+                if label == "Pumping":
+                    if vy_sign != 0 and vy_sign != last_vy_sign:
+                        pump_phase += 1
+                        last_vy_sign = vy_sign
+                    if (
+                        pump_phase >= 2
+                        and (analyzed_frames - last_pump_emit_frame) >= PUMP_MIN_INTERVAL_FR
+                        and y_range >= PUMP_MIN_Y_RANGE
+                    ):
+                        log.append("Pumping")
+                        last_pump_emit_frame = analyzed_frames
+                        pump_phase = 0
+                else:
+                    if (analyzed_frames - last_neutral_frame) >= NEUTRAL_RESET_FRAMES:
+                        pump_phase = 0
+
+                if vy_sign != 0:
+                    last_vy_sign = vy_sign
+
+            # Non-pumping
+            if label != "" and label != "Pumping":
+                if label == stable_label:
+                    stable_count += 1
+                else:
+                    stable_label = label
+                    stable_count = 1
+
+                if (analyzed_frames - last_neutral_frame) >= NEUTRAL_RESET_FRAMES:
+                    active_move = ""
+
+                if stable_count >= MIN_STABLE_FRAMES:
+                    if active_move == "":
+                        log.append(label)
+                        active_move = label
+                    elif active_move != label:
+                        log.append(label)
+                        active_move = label
+            elif label == "":
+                stable_label = ""
+                stable_count = 0
+
+            frame_idx += 1
 
         cap.release()
 
