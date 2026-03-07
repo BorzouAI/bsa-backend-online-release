@@ -339,7 +339,7 @@ def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
         cap.release()
 
         score = wave_score(log)
-        tips = "12345"
+        tips = "Try to maintain balance through transitions and keep knees bent for control."
 
         return {
             "score": score,
