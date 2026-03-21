@@ -113,28 +113,37 @@ def chicken_jones_chat(payload: ChickenJonesRequest):
         input_items = [
             {
                 "role": "system",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": SYSTEM_PROMPT
-                    }
-                ],
+                "content": SYSTEM_PROMPT,
             }
         ]
 
         for msg in payload.messages:
             role = "assistant" if msg.role == "assistant" else "user"
-            input_items.append(
-                {
-                    "role": role,
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": msg.content
-                        }
-                    ],
-                }
-            )
+
+            if role == "assistant":
+                input_items.append(
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": msg.content,
+                            }
+                        ],
+                    }
+                )
+            else:
+                input_items.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": msg.content,
+                            }
+                        ],
+                    }
+                )
 
         response = client.responses.create(
             model="gpt-5.4-mini",
