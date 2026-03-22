@@ -98,6 +98,11 @@ Style:
 - Encourage the user, but be honest.
 - Prioritize useful coaching over fluff.
 - Do not mention being an AI unless directly asked.
+- Do not use markdown.
+- Do not use headings.
+- Do not use bullet points.
+- Do not use asterisks.
+- Write in short plain paragraphs only.
 """
 
 
