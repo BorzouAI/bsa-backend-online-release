@@ -1,6 +1,6 @@
 # =========================
 # BorzouSurfApp.py
-# Backend: Surf Analyzer + Chicken Jones Chat
+# Backend: Surf Analyzer
 # =========================
 
 import os
@@ -8,13 +8,11 @@ import hashlib
 import sys
 import tempfile
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Response, Request
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
 import cv2
 import numpy as np
-from openai import OpenAI
 
 app = FastAPI()
 
@@ -27,20 +25,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- OpenAI client ---
-# Keep your API key in Render environment variables:
-# OPENAI_API_KEY=your_real_key_here
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-
-@app.api_route("/health", methods=["GET", "HEAD"])
-def health(request: Request):
-    if request.method == "HEAD":
-        return Response(status_code=200)
+@app.get("/health")
+def health():
     return {"ok": True}
 
 
-# ✅ Debug endpoint (no Shell needed)
 # Hit: https://bsa-backend-online-release-cmk9.onrender.com/debug/mediapipe
 @app.get("/debug/mediapipe")
 def debug_mediapipe():
@@ -51,138 +41,74 @@ def debug_mediapipe():
             "mediapipe_version": getattr(mp, "__version__", "unknown"),
             "mediapipe_file": getattr(mp, "__file__", "unknown"),
             "has_solutions": hasattr(mp, "solutions"),
-            "has_tasks": hasattr(mp, "tasks"),
-            "has_python_pkg": hasattr(mp, "python"),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to import mediapipe: {e}")
 
 
-@app.get("/routes-test")
-def routes_test():
-    return {
-        "ok": True,
-        "has_chicken_jones": True,
-        "version": "chicken-jones-v1"
-    }
-
-# ------------------------
-# Chicken Jones chat models
-# ------------------------
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
-
-class ChickenJonesRequest(BaseModel):
-    messages: list[ChatMessage]
-
-
-# ------------------------
-# Chicken Jones system prompt
-# ------------------------
-SYSTEM_PROMPT = """
-You are Chicken Jones, the built-in surf coach inside the BorzouAI app.
-
-Your job:
-- Answer only surfing-related questions and closely related surf topics.
-- Topics you can help with include surfing technique, maneuvers, turns, snaps, cutbacks, bottom turns, speed generation, paddling, positioning, wave reading, surf etiquette, training for surfing, surf fitness, equipment, boards, fins, and conditions.
-- Be friendly, helpful, slightly playful, and coach-like.
-- Explain things in simple language.
-- Give practical advice surfers can actually use.
-- Keep answers concise and readable unless the user asks for more detail.
-- If the user asks something unrelated to surfing, politely redirect them back to surf topics.
-
-Style:
-- Sound natural, chill, and knowledgeable.
-- Encourage the user, but be honest.
-- Prioritize useful coaching over fluff.
-- Do not mention being an AI unless directly asked.
-- Do not use markdown.
-- Do not use headings.
-- Do not use bullet points.
-- Do not use asterisks.
-- Write in short plain paragraphs only.
-"""
-
-
-@app.post("/chat/chicken-jones")
-def chicken_jones_chat(payload: ChickenJonesRequest):
-    try:
-        if not os.getenv("OPENAI_API_KEY"):
-            raise HTTPException(
-                status_code=500,
-                detail="OPENAI_API_KEY is not set on the server."
-            )
-
-        input_items = [
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT,
-            }
-        ]
-
-        for msg in payload.messages:
-            role = "assistant" if msg.role == "assistant" else "user"
-
-            if role == "assistant":
-                input_items.append(
-                    {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": msg.content,
-                            }
-                        ],
-                    }
-                )
-            else:
-                input_items.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": msg.content,
-                            }
-                        ],
-                    }
-                )
-
-        response = client.responses.create(
-            model="gpt-5.4-mini",
-            input=input_items,
-        )
-
-        return {"reply": response.output_text}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Chicken Jones server error: {e}")
-
-
-# --- Scoring config (simple, as you had) ---
+# --- Scoring config ---
+# Conservative v1 scoring:
+# - Pumps should help a little, not dominate.
+# - Turns/cutbacks matter more.
+# - Each next maneuver is worth less.
+# - Repeating the same maneuver back-to-back is penalized.
+# - 9+ should be very hard to get.
 BASE_POINTS = {
-    "Bottom Turn": 2.0,
-    "Top Turn": 2.4,
-    "Cutback": 3.0,
-    "Pumping": 0.5,
+    "Bottom Turn": 1.6,
+    "Top Turn": 2.0,
+    "Cutback": 2.6,
+    "Pumping": 0.30,
 }
-DECAY_FACTOR = 0.5  # decay after 3rd repeat
+
+# Every next logged maneuver gets reduced.
+SEQUENCE_DECAY = 0.72
+
+# Later maneuvers still count a bit, but not much.
+MIN_SEQUENCE_MULTIPLIER = 0.18
+
+# Back-to-back same move penalty.
+REPEAT_MOVE_MULTIPLIER = 0.55
+
+# Slight bonus for mixing up non-pumping maneuvers.
+VARIETY_BONUS = 0.20
+
+# Soft-cap region: once raw score crosses this, gains compress heavily.
+SOFT_CAP_START = 8.0
+SOFT_CAP_FACTOR = 0.28
 
 
 def wave_score(maneuver_log):
+    if not maneuver_log:
+        return 0.0
+
     total_score = 0.0
-    counted = {}
-    for m in maneuver_log:
-        counted[m] = counted.get(m, 0) + 1
-    for maneuver, count in counted.items():
+    seen_major_moves = set()
+    prev_move = None
+
+    for i, maneuver in enumerate(maneuver_log):
         base = BASE_POINTS.get(maneuver, 0.0)
-        for i in range(count):
-            decay_multiplier = 1.0 if i < 3 else (DECAY_FACTOR ** (i - 2))
-            total_score += base * decay_multiplier
+        if base <= 0:
+            continue
+
+        seq_multiplier = max(SEQUENCE_DECAY ** i, MIN_SEQUENCE_MULTIPLIER)
+        move_score = base * seq_multiplier
+
+        # Penalize repeating the exact same move back-to-back.
+        if prev_move == maneuver:
+            move_score *= REPEAT_MOVE_MULTIPLIER
+
+        # Small reward for adding a new major maneuver type to the wave.
+        if maneuver != "Pumping" and maneuver not in seen_major_moves:
+            move_score += VARIETY_BONUS
+            seen_major_moves.add(maneuver)
+
+        total_score += move_score
+        prev_move = maneuver
+
+    # Soft cap near the top so 9+ is very hard.
+    if total_score > SOFT_CAP_START:
+        total_score = SOFT_CAP_START + (total_score - SOFT_CAP_START) * SOFT_CAP_FACTOR
+
     return min(round(total_score, 2), 9.99)
 
 
@@ -209,63 +135,32 @@ def detect_pumping(buf):
 
 
 def _get_mp_pose_module():
-    """
-    Robustly obtains the Pose solution module.
-    Fixes cases where `mediapipe` imports but `mp.solutions` isn't attached
-    (or is missing due to packaging/import weirdness).
-    """
     import mediapipe as mp
 
-    # Normal path
-    if hasattr(mp, "solutions"):
-        try:
-            return mp.solutions.pose
-        except Exception:
-            pass
-
-    # Compatibility path: mediapipe.python.solutions
-    try:
-        from mediapipe.python import solutions as mp_solutions  # type: ignore
-        # Attach for downstream code that expects mp.solutions.*
-        mp.solutions = mp_solutions  # type: ignore
-        return mp_solutions.pose
-    except Exception as e:
+    if not hasattr(mp, "solutions"):
         raise RuntimeError(
-            "Mediapipe imported but Pose Solutions API is unavailable. "
+            "Mediapipe imported but mp.solutions is missing. "
             f"mp.__version__={getattr(mp, '__version__', 'unknown')} "
-            f"mp.__file__={getattr(mp, '__file__', 'unknown')} "
-            f"hasattr(mp,'solutions')={hasattr(mp,'solutions')} "
-            f"inner_error={e}"
+            f"mp.__file__={getattr(mp, '__file__', 'unknown')}"
         )
+    return mp.solutions.pose
 
 
 @app.post("/analyze")
-async def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
-    """
-    NOTE:
-    - Duplicate upload blocking is intentionally REMOVED (no 409 Conflict).
-    - Mediapipe import is done inside this handler so the server can boot even if
-      mediapipe isn't installed yet. If it's missing, you'll get a clear error.
-    """
+def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
     if not video:
         raise HTTPException(status_code=400, detail="No video uploaded.")
 
-    video_bytes = await video.read()
+    try:
+        video_bytes = video.file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read uploaded file: {e}")
+
     if not video_bytes:
         raise HTTPException(status_code=400, detail="Empty video file.")
 
     tmp_path = None
     try:
-        # Lazy import so server can start without mediapipe installed
-        try:
-            import mediapipe as mp  # noqa: F401
-        except Exception as e:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Mediapipe not available on server. Install it to analyze videos. ({e})",
-            )
-
-        # ✅ Robust pose module getter (fixes "no attribute solutions")
         try:
             mp_pose = _get_mp_pose_module()
         except Exception as e:
@@ -279,35 +174,36 @@ async def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
         if not cap.isOpened():
             raise HTTPException(status_code=400, detail="Could not open video (codec/format).")
 
-        # -------- Event detection timing (from FPS) --------
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
-        # Non-pumping: emit once per event; hold until different maneuver or neutral gap
-        STABLE_SEC = 0.20         # require ~0.20s stable label
-        NEUTRAL_RESET_SEC = 0.25  # need ~0.25s neutral to clear active move
+        # -------- Speed controls --------
+        TARGET_ANALYSIS_FPS = 5.0
+        FRAME_STEP = max(1, int(round(fps / TARGET_ANALYSIS_FPS)))
+        MAX_ANALYZED_FRAMES = 900
 
-        # Pumping: count one per full oscillation (up+down) with min interval + amplitude
+        # -------- Event timing --------
+        STABLE_SEC = 0.20
+        NEUTRAL_RESET_SEC = 0.25
         PUMP_MIN_INTERVAL_SEC = 0.35
         PUMP_MIN_Y_RANGE = 0.010
 
-        MIN_STABLE_FRAMES = max(4, int(fps * STABLE_SEC))
-        NEUTRAL_RESET_FRAMES = max(1, int(fps * NEUTRAL_RESET_SEC))
-        PUMP_MIN_INTERVAL_FR = max(1, int(fps * PUMP_MIN_INTERVAL_SEC))
+        analysis_fps = fps / FRAME_STEP
+        MIN_STABLE_FRAMES = max(2, int(analysis_fps * STABLE_SEC))
+        NEUTRAL_RESET_FRAMES = max(1, int(analysis_fps * NEUTRAL_RESET_SEC))
+        PUMP_MIN_INTERVAL_FR = max(1, int(analysis_fps * PUMP_MIN_INTERVAL_SEC))
 
         log = []
         buffer = []
         is_frontside = (stance == "f")
 
-        # -------- State --------
         frame_idx = 0
+        analyzed_frames = 0
 
-        # Non-pumping
-        active_move = ""       # current non-pumping maneuver
-        stable_label = ""      # candidate stabilizing
+        active_move = ""
+        stable_label = ""
         stable_count = 0
         last_neutral_frame = -10**9
 
-        # Pumping (two sign changes = one pump)
         last_vy_sign = 0
         pump_phase = 0
         last_pump_emit_frame = -10**9
@@ -345,7 +241,6 @@ async def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
                 return "Cutback"
             return ""
 
-        # -------- Main loop --------
         with mp_pose.Pose(
             model_complexity=2,
             smooth_landmarks=True,
@@ -357,12 +252,25 @@ async def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
                 if not ret:
                     break
 
+                if frame_idx % FRAME_STEP != 0:
+                    frame_idx += 1
+                    continue
+
+                analyzed_frames += 1
+                if analyzed_frames > MAX_ANALYZED_FRAMES:
+                    break
+
+                h, w = frame.shape[:2]
+                if w > 640:
+                    new_w = 640
+                    new_h = int(h * (new_w / w))
+                    frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results = pose.process(rgb)
 
                 if not results.pose_landmarks:
-                    # treat as neutral
-                    last_neutral_frame = frame_idx
+                    last_neutral_frame = analyzed_frames
                     frame_idx += 1
                     continue
 
@@ -374,11 +282,10 @@ async def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
 
                 label = classify(buffer, lms)
 
-                # ----- Neutral bookkeeping -----
                 if label == "":
-                    last_neutral_frame = frame_idx
+                    last_neutral_frame = analyzed_frames
 
-                # ----- Pumping: count per full oscillation -----
+                # Pumping
                 if len(buffer) >= 2:
                     vy = buffer[-1][1] - buffer[-2][1]
                     vy_sign = 1 if vy > 0 else (-1 if vy < 0 else 0)
@@ -388,24 +295,24 @@ async def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
 
                     if label == "Pumping":
                         if vy_sign != 0 and vy_sign != last_vy_sign:
-                            pump_phase += 1  # sign flip
+                            pump_phase += 1
                             last_vy_sign = vy_sign
                         if (
                             pump_phase >= 2
-                            and (frame_idx - last_pump_emit_frame) >= PUMP_MIN_INTERVAL_FR
+                            and (analyzed_frames - last_pump_emit_frame) >= PUMP_MIN_INTERVAL_FR
                             and y_range >= PUMP_MIN_Y_RANGE
                         ):
                             log.append("Pumping")
-                            last_pump_emit_frame = frame_idx
+                            last_pump_emit_frame = analyzed_frames
                             pump_phase = 0
                     else:
-                        if (frame_idx - last_neutral_frame) >= NEUTRAL_RESET_FRAMES:
+                        if (analyzed_frames - last_neutral_frame) >= NEUTRAL_RESET_FRAMES:
                             pump_phase = 0
 
                     if vy_sign != 0:
                         last_vy_sign = vy_sign
 
-                # ----- Non-pumping: emit once, hold until different or neutral gap -----
+                # Non-pumping
                 if label != "" and label != "Pumping":
                     if label == stable_label:
                         stable_count += 1
@@ -413,8 +320,7 @@ async def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
                         stable_label = label
                         stable_count = 1
 
-                    # clear active move after neutral gap
-                    if (frame_idx - last_neutral_frame) >= NEUTRAL_RESET_FRAMES:
+                    if (analyzed_frames - last_neutral_frame) >= NEUTRAL_RESET_FRAMES:
                         active_move = ""
 
                     if stable_count >= MIN_STABLE_FRAMES:
@@ -425,7 +331,6 @@ async def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
                             log.append(label)
                             active_move = label
                 elif label == "":
-                    # reset stabilization in neutral
                     stable_label = ""
                     stable_count = 0
 
@@ -435,7 +340,12 @@ async def analyze_video(stance: str = Form(...), video: UploadFile = File(...)):
 
         score = wave_score(log)
         tips = "Try to maintain balance through transitions and keep knees bent for control."
-        return {"score": score, "maneuvers": log, "tips": tips}
+
+        return {
+            "score": score,
+            "maneuvers": log,
+            "tips": tips,
+        }
 
     except HTTPException:
         raise
